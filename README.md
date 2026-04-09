@@ -53,3 +53,9 @@ After setup, open http://localhost:8392 in your browser to use the AI agent.
 ## License
 
 MIT
+
+## to stop
+
+lsof -nP -iTCP:8392 -sTCP:LISTEN
+
+kill -TERM \<PID\>
