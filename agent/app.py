@@ -1281,6 +1281,12 @@ async def serve_workspace_file(filename: str):
     return FileResponse(str(fpath), media_type=ct)
 
 
+@app.get("/__workspace/{filename:path}")
+async def serve_workspace_file_compat(filename: str):
+    """Compatibility route for legacy '__workspace' image URLs."""
+    return await serve_workspace_file(filename)
+
+
 @app.get("/api/model")
 async def get_model():
     return {"model": MODEL, "agent_name": CONFIG["agent_name"], "agent_name_en": CONFIG["agent_name_en"]}
@@ -1357,25 +1363,72 @@ def _restart_server():
 
 
 # --- Chat API ---
-def _process_tool_calls(full_response: str):
-    results = []
+def _extract_tool_calls(full_response: str) -> list[dict]:
+    """Extract tool-call JSON objects from fenced or plain JSON output."""
+    allowed_tools = {
+        "web_search", "python_run", "file_read", "file_write",
+        "list_files", "rewrite_self", "create_plugin", "use_plugin",
+    }
+    calls: list[dict] = []
+    seen_payloads: set[str] = set()
+    fenced_ranges: list[tuple[int, int]] = []
+
+    # First, parse canonical fenced blocks: ```tool_call ... ```
     search_from = 0
     while True:
         marker = "```tool_call"
         start = full_response.find(marker, search_from)
         if start == -1:
             break
-        start += len(marker)
-        end = full_response.find("```", start)
+        json_start = start + len(marker)
+        end = full_response.find("```", json_start)
         if end == -1:
             break
-        tc_json = full_response[start:end].strip()
+        fenced_ranges.append((start, end + 3))
+        payload = full_response[json_start:end].strip()
         search_from = end + 3
         try:
-            tc = json.loads(tc_json)
-        except json.JSONDecodeError as e:
-            results.append({"error": f"JSON parse error: {e}"})
+            obj = json.loads(payload)
+            if isinstance(obj, dict) and obj.get("tool") in allowed_tools:
+                key = json.dumps(obj, sort_keys=True, ensure_ascii=False)
+                if key not in seen_payloads:
+                    seen_payloads.add(key)
+                    calls.append(obj)
+        except json.JSONDecodeError:
             continue
+
+    # Then parse plain JSON objects embedded in text, e.g. {"tool":"python_run", ...}
+    decoder = json.JSONDecoder()
+    idx = 0
+    text_len = len(full_response)
+    while idx < text_len:
+        # Skip areas already parsed as fenced blocks.
+        if any(start <= idx < end for start, end in fenced_ranges):
+            matching = [end for start, end in fenced_ranges if start <= idx < end]
+            idx = max(matching)
+            continue
+        if full_response[idx] != "{":
+            idx += 1
+            continue
+        try:
+            obj, end_idx = decoder.raw_decode(full_response, idx)
+        except json.JSONDecodeError:
+            idx += 1
+            continue
+        if isinstance(obj, dict) and obj.get("tool") in allowed_tools:
+            key = json.dumps(obj, sort_keys=True, ensure_ascii=False)
+            if key not in seen_payloads:
+                seen_payloads.add(key)
+                calls.append(obj)
+        idx = end_idx
+
+    return calls
+
+
+def _process_tool_calls(full_response: str):
+    results = []
+    tool_calls = _extract_tool_calls(full_response)
+    for tc in tool_calls:
 
         tool = tc.get("tool", "")
         if tool == "web_search":
@@ -1535,8 +1588,8 @@ async def chat_endpoint(request: Request):
                             except json.JSONDecodeError:
                                 continue
 
-            if "```tool_call" in full_response:
-                results = _process_tool_calls(full_response)
+            results = _process_tool_calls(full_response)
+            if results:
                 need_restart = False
                 tool_outputs = []  # Collect results that need LLM follow-up
                 for r in results:
